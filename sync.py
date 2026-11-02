@@ -315,6 +315,10 @@ def main() -> None:
     parser.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
     parser.add_argument("--days", type=int, default=21, help="look-ahead window")
     parser.add_argument("--send", action="store_true", help="actually send emails and update state (default: dry run)")
+    parser.add_argument(
+        "--outbox", type=pathlib.Path, nargs="?", const=HERE / "outbox",
+        help="write each email as an .eml file into DIR (default: outbox/) instead of sending; state is untouched",
+    )
     parser.add_argument("--baseline", action="store_true", help="mark all current events as seen without emailing")
     args = parser.parse_args()
 
@@ -333,6 +337,15 @@ def main() -> None:
         now = datetime.datetime.now().isoformat(timespec="seconds")
         save_state(args.state, {**sent, **{e.key: now for e in events}})
         logger.info("Baseline saved: %d events marked as seen", len(events))
+        return
+
+    if args.outbox:
+        args.outbox.mkdir(parents=True, exist_ok=True)
+        sender = cfg["email"]["sender"]
+        for i, e in enumerate(new, 1):
+            path = args.outbox / f"{i:02d}_{e.when:%Y-%m-%d}_{e.account}.eml"
+            path.write_bytes(bytes(build_message(e, sender, to)))
+        logger.info("Wrote %d .eml file(s) to %s", len(new), args.outbox)
         return
 
     if not args.send:
