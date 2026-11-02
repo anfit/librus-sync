@@ -120,9 +120,13 @@ def load_config(path: pathlib.Path) -> Dict[str, Any]:
             "name": item.get("name") or item["username"],
             "username": _secret(item, "username"),
             "password": _secret(item, "password"),
+            "recipients": list(item.get("recipients") or []),
         }
         for item in raw.get("accounts", [])
     ]
+    for acc in accounts:
+        if not acc["recipients"]:
+            raise SystemExit(f"Account {acc['name']} has no recipients")
     if not accounts:
         raise SystemExit(f"No accounts in {path}")
     raw["accounts"] = accounts
@@ -281,7 +285,7 @@ def _fold(line: str) -> str:
     return "\r\n".join(out)
 
 
-def build_ics(event: Event, sender: str, attendee: str, method: str = "REQUEST", sequence: int = 0) -> str:
+def build_ics(event: Event, sender: str, attendees: List[str], method: str = "REQUEST", sequence: int = 0) -> str:
     """A one-event iCalendar message so Gmail shows it as an invitation (or cancellation)."""
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     end = event.when + datetime.timedelta(days=1)
@@ -302,7 +306,7 @@ def build_ics(event: Event, sender: str, attendee: str, method: str = "REQUEST",
         f"STATUS:{'CANCELLED' if method == 'CANCEL' else 'CONFIRMED'}",
         "TRANSP:TRANSPARENT",
         f"ORGANIZER;CN=Librus:mailto:{sender}",
-        f"ATTENDEE;CN={attendee};ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:{attendee}",
+        *[f"ATTENDEE;CN={a};ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:{a}" for a in attendees],
     ]
     if event.classroom:
         lines.append(f"LOCATION:{_esc(event.classroom)}")
@@ -324,13 +328,13 @@ def gcal_link(event: Event) -> str:
     return "https://calendar.google.com/calendar/render?" + urlencode(params, quote_via=quote)
 
 
-def build_message(change: Change, sender: str, to: str) -> EmailMessage:
+def build_message(change: Change, sender: str, to: List[str], test: bool = False) -> EmailMessage:
     action, event, sequence = change
     cancel = action == "cancel"
-    prefix = {"new": "", "update": "Updated: ", "cancel": "Cancelled: "}[action]
+    prefix = ("[TEST] " if test else "") + {"new": "", "update": "Updated: ", "cancel": "Cancelled: "}[action]
     msg = EmailMessage()
     msg["From"] = sender
-    msg["To"] = to
+    msg["To"] = ", ".join(to)
     msg["Subject"] = f"{prefix}[{event.account}] {event.when:%a %d.%m} {event.what}"
     when = f"{event.when:%A, %Y-%m-%d}" + (f" ({event.when_detail})" if event.when_detail else "")
     body = (
@@ -389,6 +393,11 @@ def main() -> None:
         "--outbox", type=pathlib.Path, nargs="?", const=HERE / "outbox",
         help="write each email as an .eml file into DIR (default: outbox/) instead of sending; state is untouched",
     )
+    parser.add_argument(
+        "--test-to", metavar="ADDR",
+        help="send ONE notification (the first pending change, see --test-index) to ADDR only; state is untouched",
+    )
+    parser.add_argument("--test-index", type=int, default=1, help="which pending change --test-to sends (1-based)")
     parser.add_argument("--baseline", action="store_true", help="mark all current events as seen without emailing")
     parser.add_argument("--force", action="store_true", help="allow cancelling when Librus returned no events at all")
     args = parser.parse_args()
@@ -396,7 +405,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
     cfg = load_config(find_config(args.config))
     exclude = cfg.get("exclude", DEFAULT_EXCLUDE)
-    to = cfg["notify"]["to"]
+    recipients = {acc["name"]: acc["recipients"] for acc in cfg["accounts"]}
 
     fetched = fetch_upcoming(cfg["accounts"], args.days)
     events = [e for e in fetched if keep(e, exclude)]
@@ -410,7 +419,7 @@ def main() -> None:
         logger.info("Baseline saved: %d events marked as seen", len(events))
         return
 
-    changes = diff(events, state, args.days)
+    changes = [c for c in diff(events, state, args.days) if c[1].account in recipients]
     counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel")}
     logger.info("%d fetched, %d after filter: %s", len(fetched), len(events), counts)
 
@@ -418,20 +427,30 @@ def main() -> None:
         raise SystemExit("Librus returned no events but cancellations are pending; refusing (use --force).")
 
     sender = cfg["email"]["sender"]
+    if args.test_to:
+        if not 1 <= args.test_index <= len(changes):
+            raise SystemExit(f"--test-index {args.test_index} out of range ({len(changes)} pending change(s))")
+        change = changes[args.test_index - 1]
+        with Mailer(cfg["email"]) as mailer:
+            mailer.send(build_message(change, sender, [args.test_to], test=True))
+        logger.info("TEST sent to %s: %s [%s] %s (state untouched)", args.test_to, change[0], change[1].account, change[1].what)
+        return
+
     if args.outbox:
         args.outbox.mkdir(parents=True, exist_ok=True)
         for i, change in enumerate(changes, 1):
             action, e, _ = change
             path = args.outbox / f"{i:02d}_{action}_{e.when:%Y-%m-%d}_{e.account}.eml"
-            path.write_bytes(bytes(build_message(change, sender, to)))
+            path.write_bytes(bytes(build_message(change, sender, recipients[e.account])))
         logger.info("Wrote %d .eml file(s) to %s", len(changes), args.outbox)
         return
 
     if not args.send:
         for action, e, seq in changes:
             print(f"{action.upper():6} [{e.account}] {e.what}  (seq {seq})")
+            print(f"  to:      {', '.join(recipients[e.account])}")
             print(f"  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
-        print(f"DRY RUN: {len(changes)} email(s) would be sent to {to}")
+        print(f"DRY RUN: {len(changes)} email(s) would be sent")
         return
 
     if not changes:
@@ -439,7 +458,7 @@ def main() -> None:
     with Mailer(cfg["email"]) as mailer:
         for change in changes:
             action, e, seq = change
-            mailer.send(build_message(change, sender, to))
+            mailer.send(build_message(change, sender, recipients[e.account]))
             record(state, e, seq, cancelled=action == "cancel")
             save_state(args.state, state)  # per email, so a crash never re-sends
             logger.info("Sent %s: [%s] %s %s", action, e.account, e.when, e.what)
