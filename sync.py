@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-Email new upcoming Librus calendar events as .ics invitations.
+Email upcoming Librus calendar events as .ics invitations, and keep Google
+Calendar in step when they change or disappear.
 
 Read-only towards Librus: only calendar (terminarz) pages are fetched, so no
 message is ever marked as read. Pipeline:
 
-    fetch -> filter (drop absences etc.) -> dedupe against state.json -> email
+    fetch -> filter (drop absences etc.) -> diff against state.json -> email
+
+The diff yields three kinds of mail, all keyed by a stable UID so the
+calendar updates the same entry instead of duplicating it:
+    new     METHOD:REQUEST, SEQUENCE 0
+    update  METHOD:REQUEST, SEQUENCE+1   (description/teacher/room/... changed)
+    cancel  METHOD:CANCEL,  SEQUENCE+1   (gone from Librus, still in the window)
 
 Each event is reduced to what / when / details. Without --send nothing is
 emailed and the state is not touched (dry run).
@@ -22,9 +29,9 @@ import pathlib
 import smtplib
 import ssl
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from email.message import EmailMessage
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import librus
@@ -77,9 +84,22 @@ class Event:
 
     @property
     def key(self) -> str:
-        """Stable identity. Description edits do not make an event 'new'."""
+        """Stable identity (also the calendar UID). Content edits do not change it."""
         raw = "|".join([self.account, self.when.isoformat(), self.lesson, self.subject, self.category])
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    @property
+    def content_hash(self) -> str:
+        """Changes when an edit should reach the calendar as an update."""
+        raw = "|".join([self.interval, self.teacher, self.classroom, self.description, self.link])
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def snapshot(self) -> Dict[str, str]:
+        return {**asdict(self), "when": self.when.isoformat()}
+
+    @classmethod
+    def from_snapshot(cls, data: Dict[str, str]) -> "Event":
+        return cls(**{**data, "when": datetime.date.fromisoformat(data["when"])})
 
 
 # --- config -----------------------------------------------------------------
@@ -159,7 +179,7 @@ def login(username: str, password: str) -> librus.LibrusSession:
 
 
 def fetch_upcoming(accounts: List[Dict[str, str]], days: int) -> List[Event]:
-    """Returns events; raises if any account failed, so a partial run never marks anything as seen."""
+    """Returns events; raises if any account failed, so a partial run never changes state."""
     today = datetime.date.today()
     horizon = today + datetime.timedelta(days=days)
     events: List[Event] = []
@@ -180,19 +200,61 @@ def keep(event: Event, exclude: List[str]) -> bool:
     return not any(word.lower() in haystack for word in exclude)
 
 
-# --- state ------------------------------------------------------------------
+# --- state + diff -----------------------------------------------------------
 
-def load_state(path: pathlib.Path) -> Dict[str, str]:
-    """key -> ISO timestamp of when it was sent."""
+# state.json: {"events": {key: {"seq": int, "hash": str, "cancelled": bool,
+#                               "sent": iso timestamp, "event": snapshot}}}
+State = Dict[str, Dict[str, Any]]
+
+
+def load_state(path: pathlib.Path) -> State:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8")).get("sent", {})
+    return json.loads(path.read_text(encoding="utf-8")).get("events", {})
 
 
-def save_state(path: pathlib.Path, sent: Dict[str, str]) -> None:
+def save_state(path: pathlib.Path, state: State) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps({"sent": sent}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps({"events": state}, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def record(state: State, event: Event, seq: int, cancelled: bool = False) -> None:
+    state[event.key] = {
+        "seq": seq,
+        "hash": event.content_hash,
+        "cancelled": cancelled,
+        "sent": datetime.datetime.now().isoformat(timespec="seconds"),
+        "event": event.snapshot(),
+    }
+
+
+# (action, event, sequence); action in "new" | "update" | "cancel"
+Change = Tuple[str, Event, int]
+
+
+def diff(events: List[Event], state: State, days: int) -> List[Change]:
+    today = datetime.date.today()
+    horizon = today + datetime.timedelta(days=days)
+    changes: List[Change] = []
+    current = {e.key: e for e in events}
+
+    for key, e in current.items():
+        entry = state.get(key)
+        if entry is None:
+            changes.append(("new", e, 0))
+        elif entry["cancelled"]:
+            changes.append(("new", e, entry["seq"] + 1))  # reappeared: re-issue with a newer sequence
+        elif entry["hash"] != e.content_hash:
+            changes.append(("update", e, entry["seq"] + 1))
+
+    for key, entry in state.items():
+        if key in current or entry["cancelled"]:
+            continue
+        old = Event.from_snapshot(entry["event"])
+        if today <= old.when <= horizon:  # only judge events the fetch could actually have seen
+            changes.append(("cancel", old, entry["seq"] + 1))
+    return changes
 
 
 # --- ics + email ------------------------------------------------------------
@@ -219,25 +281,25 @@ def _fold(line: str) -> str:
     return "\r\n".join(out)
 
 
-def build_ics(event: Event, sender: str, attendee: str) -> str:
-    """A one-event iCalendar invitation (METHOD:REQUEST) so Gmail shows it as an invite."""
+def build_ics(event: Event, sender: str, attendee: str, method: str = "REQUEST", sequence: int = 0) -> str:
+    """A one-event iCalendar message so Gmail shows it as an invitation (or cancellation)."""
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     end = event.when + datetime.timedelta(days=1)
-    summary = f"{event.account} - {event.what}"
+    description = (event.when_detail + "\n" if event.when_detail else "") + event.details
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//librus-sync//EN",
-        "METHOD:REQUEST",
+        f"METHOD:{method}",
         "BEGIN:VEVENT",
         f"UID:{event.key}@librus-sync",
         f"DTSTAMP:{stamp}",
         f"DTSTART;VALUE=DATE:{event.when:%Y%m%d}",
         f"DTEND;VALUE=DATE:{end:%Y%m%d}",
-        f"SUMMARY:{_esc(summary)}",
-        f"DESCRIPTION:{_esc(event.when_detail + chr(10) + event.details if event.when_detail else event.details)}",
-        "SEQUENCE:0",
-        "STATUS:CONFIRMED",
+        f"SUMMARY:{_esc(f'{event.account} - {event.what}')}",
+        f"DESCRIPTION:{_esc(description)}",
+        f"SEQUENCE:{sequence}",
+        f"STATUS:{'CANCELLED' if method == 'CANCEL' else 'CONFIRMED'}",
         "TRANSP:TRANSPARENT",
         f"ORGANIZER;CN=Librus:mailto:{sender}",
         f"ATTENDEE;CN={attendee};ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:{attendee}",
@@ -262,21 +324,29 @@ def gcal_link(event: Event) -> str:
     return "https://calendar.google.com/calendar/render?" + urlencode(params, quote_via=quote)
 
 
-def build_message(event: Event, sender: str, to: str) -> EmailMessage:
+def build_message(change: Change, sender: str, to: str) -> EmailMessage:
+    action, event, sequence = change
+    cancel = action == "cancel"
+    prefix = {"new": "", "update": "Updated: ", "cancel": "Cancelled: "}[action]
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = to
-    msg["Subject"] = f"[{event.account}] {event.when:%a %d.%m} {event.what}"
+    msg["Subject"] = f"{prefix}[{event.account}] {event.when:%a %d.%m} {event.what}"
     when = f"{event.when:%A, %Y-%m-%d}" + (f" ({event.when_detail})" if event.when_detail else "")
-    msg.set_content(
+    body = (
+        f"{'This event was removed from Librus.' + chr(10) if cancel else ''}"
+        f"{'This event was changed in Librus.' + chr(10) if action == 'update' else ''}"
         f"What:    {event.account} - {event.what}\n"
         f"When:    {when}\n"
-        f"Details:\n{event.details or '-'}\n\n"
-        f"Add to Google Calendar: {gcal_link(event)}\n"
+        f"Details:\n{event.details or '-'}\n"
     )
-    ics = build_ics(event, sender, to)
-    msg.add_alternative(ics, subtype="calendar", charset="utf-8", params={"method": "REQUEST"})
-    msg.add_attachment(ics, subtype="calendar", charset="utf-8", params={"method": "REQUEST"}, filename="event.ics")
+    if not cancel:
+        body += f"\nAdd to Google Calendar: {gcal_link(event)}\n"
+    msg.set_content(body)
+    ics = build_ics(event, sender, to, "CANCEL" if cancel else "REQUEST", sequence)
+    params = {"method": "CANCEL" if cancel else "REQUEST"}
+    msg.add_alternative(ics, subtype="calendar", charset="utf-8", params=params)
+    msg.add_attachment(ics, subtype="calendar", charset="utf-8", params=params, filename="event.ics")
     return msg
 
 
@@ -310,7 +380,7 @@ class Mailer:
 # --- main -------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=pathlib.Path, help="default: config.yml, then config.yaml")
     parser.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
     parser.add_argument("--days", type=int, default=21, help="look-ahead window")
@@ -320,6 +390,7 @@ def main() -> None:
         help="write each email as an .eml file into DIR (default: outbox/) instead of sending; state is untouched",
     )
     parser.add_argument("--baseline", action="store_true", help="mark all current events as seen without emailing")
+    parser.add_argument("--force", action="store_true", help="allow cancelling when Librus returned no events at all")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
@@ -329,40 +400,49 @@ def main() -> None:
 
     fetched = fetch_upcoming(cfg["accounts"], args.days)
     events = [e for e in fetched if keep(e, exclude)]
-    sent = load_state(args.state)
-    new = [e for e in events if e.key not in sent]
-    logger.info("%d fetched, %d after filter, %d new", len(fetched), len(events), len(new))
+    state = load_state(args.state)
 
     if args.baseline:
-        now = datetime.datetime.now().isoformat(timespec="seconds")
-        save_state(args.state, {**sent, **{e.key: now for e in events}})
+        for e in events:
+            if e.key not in state:
+                record(state, e, 0)
+        save_state(args.state, state)
         logger.info("Baseline saved: %d events marked as seen", len(events))
         return
 
+    changes = diff(events, state, args.days)
+    counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel")}
+    logger.info("%d fetched, %d after filter: %s", len(fetched), len(events), counts)
+
+    if counts["cancel"] and not events and not args.force:
+        raise SystemExit("Librus returned no events but cancellations are pending; refusing (use --force).")
+
+    sender = cfg["email"]["sender"]
     if args.outbox:
         args.outbox.mkdir(parents=True, exist_ok=True)
-        sender = cfg["email"]["sender"]
-        for i, e in enumerate(new, 1):
-            path = args.outbox / f"{i:02d}_{e.when:%Y-%m-%d}_{e.account}.eml"
-            path.write_bytes(bytes(build_message(e, sender, to)))
-        logger.info("Wrote %d .eml file(s) to %s", len(new), args.outbox)
+        for i, change in enumerate(changes, 1):
+            action, e, _ = change
+            path = args.outbox / f"{i:02d}_{action}_{e.when:%Y-%m-%d}_{e.account}.eml"
+            path.write_bytes(bytes(build_message(change, sender, to)))
+        logger.info("Wrote %d .eml file(s) to %s", len(changes), args.outbox)
         return
 
     if not args.send:
-        for e in new:
-            print(f"[{e.account}] {e.what}\n  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
-        print(f"DRY RUN: {len(new)} new event(s) would be emailed to {to}")
+        for action, e, seq in changes:
+            print(f"{action.upper():6} [{e.account}] {e.what}  (seq {seq})")
+            print(f"  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
+        print(f"DRY RUN: {len(changes)} email(s) would be sent to {to}")
         return
 
-    if not new:
+    if not changes:
         return
-    sender = cfg["email"]["sender"]
     with Mailer(cfg["email"]) as mailer:
-        for e in new:
-            mailer.send(build_message(e, sender, to))
-            sent[e.key] = datetime.datetime.now().isoformat(timespec="seconds")
-            save_state(args.state, sent)  # per event, so a crash never re-sends
-            logger.info("Sent: [%s] %s %s", e.account, e.when, e.what)
+        for change in changes:
+            action, e, seq = change
+            mailer.send(build_message(change, sender, to))
+            record(state, e, seq, cancelled=action == "cancel")
+            save_state(args.state, state)  # per email, so a crash never re-sends
+            logger.info("Sent %s: [%s] %s %s", action, e.account, e.when, e.what)
 
 
 if __name__ == "__main__":
