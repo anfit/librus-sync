@@ -416,7 +416,9 @@ def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Opt
         elif entry["cancelled"]:
             changes.append(("new", e, entry["seq"] + 1))  # reappeared: re-issue with a newer sequence
         elif entry["hash"] != e.content_hash:
-            e.start, e.end = entry["event"].get("start", ""), entry["event"].get("end", "")  # keep what was sent
+            if e.interval == entry["event"].get("interval", ""):
+                # times derive from the lesson: keep what was sent. An edited explicit range is real news.
+                e.start, e.end = entry["event"].get("start", ""), entry["event"].get("end", "")
             changes.append(("update", e, entry["seq"] + 1))
 
     for key, entry in events_state.items():
