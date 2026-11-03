@@ -172,6 +172,9 @@ def load_config(path: pathlib.Path) -> Dict[str, Any]:
             "username": _secret(item, "username"),
             "password": _secret(item, "password"),
             "recipients": list(item.get("recipients") or []),
+            # Message digests may only go to parents, so they never fall back to `recipients`
+            # (which also holds the children). No list = no digest for that account.
+            "message_recipients": list(item.get("message_recipients") or []),
         }
         for item in raw.get("accounts", [])
     ]
@@ -408,6 +411,9 @@ def fetch_all(
             failures[name] = (f"{type(exc).__name__}: {exc}", "")
         if name in failures:
             logger.error("Account %s failed: %s", name, failures[name][0])
+        if not acc["message_recipients"]:
+            logger.info("Message digest is off for %s (no message_recipients configured)", name)
+            continue
         try:
             unread[name] = fetch_unread(api)
         except ScrapeError as exc:
@@ -834,6 +840,7 @@ def main() -> None:
     cfg = load_config(find_config(args.config))
     exclude = cfg.get("exclude", DEFAULT_EXCLUDE)
     recipients = {acc["name"]: acc["recipients"] for acc in cfg["accounts"]}
+    message_recipients = {acc["name"]: acc["message_recipients"] for acc in cfg["accounts"]}
     secrets = [s for acc in cfg["accounts"] for s in (acc["username"], acc["password"])]
     sender = cfg["email"]["sender"]
     admin = cfg.get("admin")
@@ -918,7 +925,7 @@ def main() -> None:
             path.write_bytes(bytes(build_message(change, sender, recipients[e.account])))
         for name, new in digests:
             (args.outbox / f"digest_{name}.eml").write_bytes(
-                bytes(build_digest(name, new, sender, recipients[name], last_checked.get(name))))
+                bytes(build_digest(name, new, sender, message_recipients[name], last_checked.get(name))))
         for i, alert in enumerate(alerts, 1):
             path = args.outbox / f"alert{i:02d}_{alert.kind}_{alert.account}.eml"
             path.write_bytes(bytes(build_alert(alert, sender, admin or "(no admin)", secrets)))
@@ -929,7 +936,7 @@ def main() -> None:
             print(f"  to:      {', '.join(recipients[e.account])}")
             print(f"  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
         for name, new in digests:
-            print(f"DIGEST {digest_subject(name, new, last_checked.get(name))}  to: {', '.join(recipients[name])}")
+            print(f"DIGEST {digest_subject(name, new, last_checked.get(name))}  to: {', '.join(message_recipients[name])}")
             for m in new:
                 print(f"  - {m.sender}: {m.subject}  ({m.sent[:16]})")
         for name in first_seen:
@@ -956,7 +963,7 @@ def main() -> None:
                     save_state(args.state, doc)
                     logger.info("Alert %s: %s", alert.kind, alert.account)
                 for name, new in digests:
-                    mailer.send(build_digest(name, new, sender, recipients[name], last_checked.get(name)))
+                    mailer.send(build_digest(name, new, sender, message_recipients[name], last_checked.get(name)))
                     settle_messages(doc, name, unread[name], now)
                     save_state(args.state, doc)
                     logger.info("Sent digest: [%s] %d new message(s)", name, len(new))
