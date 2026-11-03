@@ -2,3 +2,4 @@ librus==0.0.15
 lxml_html_clean
 PyYAML>=6.0.2
 librus_pyapi @ https://github.com/emsi/librus_pyapi/archive/1dfbb98d20ba84b459cb32319d7e273279ee959f.tar.gz
+tzdata

@@ -35,10 +35,12 @@ import re
 import smtplib
 import ssl
 import sys
+import unicodedata
 from dataclasses import asdict, dataclass
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 import librus
 import requests_html
@@ -57,6 +59,8 @@ DEFAULT_EXCLUDE = ["nieobecn", "absen"]
 # upcoming is treated as a broken scraper, not as "everything was removed".
 SUSPICIOUS_EMPTY_MIN_TRACKED = 3
 REALERT_AFTER = datetime.timedelta(hours=24)
+WARSAW = ZoneInfo("Europe/Warsaw")
+RANGE_RE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
 
 
 class ScrapeError(Exception):
@@ -79,6 +83,10 @@ class Event:
     classroom: str
     description: str
     link: str
+    # Derived, Warsaw wall-clock "HH:MM"; empty = all-day. Deliberately outside key and
+    # content_hash, so adding or refining times never triggers 'Updated:' mails.
+    start: str = ""
+    end: str = ""
 
     @property
     def what(self) -> str:
@@ -86,7 +94,8 @@ class Event:
 
     @property
     def when_detail(self) -> str:
-        return ", ".join(p for p in [f"lesson {self.lesson}" if self.lesson else "", self.interval] if p)
+        timing = self.interval or (f"{self.start}-{self.end}" if self.start else "")
+        return ", ".join(p for p in [f"lesson {self.lesson}" if self.lesson else "", timing] if p)
 
     @property
     def details(self) -> str:
@@ -211,8 +220,79 @@ def check_calendar_page(page: Any) -> None:
         raise ScrapeError("calendar markup not found (layout changed?)", _snippet(page))
 
 
-def fetch_account(acc: Dict[str, Any], days: int) -> List[Event]:
-    """All events of one account within the window. Raises on any scraping problem."""
+def _hhmm(h: str, m: str) -> str:
+    return f"{int(h):02d}:{m}"
+
+
+def parse_range(text: str) -> Optional[Tuple[str, str]]:
+    """'09:45 - 10:30' -> ('09:45', '10:30'); None unless a valid forward range."""
+    m = RANGE_RE.fullmatch((text or "").strip())
+    if not m:
+        return None
+    start, end = _hhmm(m[1], m[2]), _hhmm(m[3], m[4])
+    return (start, end) if start < end else None
+
+
+def _words(text: str) -> List[str]:
+    text = unicodedata.normalize("NFKD", text.lower())
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    words = re.sub(r"[^a-z0-9 ]", " ", text).split()
+    return [w for w in words if w not in ("jezyk", "j")]  # shared by every language subject
+
+
+def same_subject(a: str, b: str) -> bool:
+    """Strict on purpose: a wrong match would put an event at the wrong hour."""
+    return any(x[:4] == y[:4] for x in _words(a) for y in _words(b) if len(x) >= 4 and len(y) >= 4)
+
+
+def sane_bells(table: Dict[str, str]) -> bool:
+    """Lessons parse, run in order without overlap, and last about 45 minutes."""
+    minutes = lambda s: int(s[:2]) * 60 + int(s[3:])
+    prev_end = ""
+    for idx in sorted(table, key=lambda k: int(k) if k.isdigit() else 99):
+        rng = parse_range(table[idx])
+        if not rng or not 35 <= minutes(rng[1]) - minutes(rng[0]) <= 60 or rng[0] < prev_end:
+            return False
+        prev_end = rng[1]
+    return bool(table)
+
+
+def fetch_timing(http: requests_html.HTMLSession) -> Dict[str, Any]:
+    """Bell table (lesson -> time) and template-week grid (weekday|lesson -> subjects). Raises if unusable."""
+    session = librus.LibrusSession()
+    session._html_session = http
+    table: Dict[str, str] = {}
+    grid: Dict[str, List[str]] = {}
+    for lesson in session.schedule():
+        rng = parse_range(lesson.time)
+        if rng:
+            table[lesson.index] = f"{rng[0]}-{rng[1]}"
+        grid.setdefault(f"{lesson.day}|{lesson.index}", []).append(lesson.name)
+    if not sane_bells(table):
+        raise ValueError(f"bell table failed sanity check: {table}")
+    return {"table": table, "grid": grid}
+
+
+def apply_timing(events: List[Event], timing: Optional[Dict[str, Any]]) -> None:
+    """Explicit range first; else the lesson's bell time if the timetable agrees on the subject; else all-day."""
+    for e in events:
+        rng = parse_range(e.interval)
+        if not rng and timing and e.lesson in timing["table"]:
+            subjects = timing["grid"].get(f"{e.when.weekday()}|{e.lesson}", [])
+            if any(same_subject(e.subject, s) for s in subjects):
+                rng = parse_range(timing["table"][e.lesson])
+        if rng:
+            e.start, e.end = rng
+
+
+def fetch_account(
+    acc: Dict[str, Any], days: int, cached: Optional[Dict[str, Any]] = None
+) -> Tuple[List[Event], Optional[Dict[str, Any]]]:
+    """Events of one account within the window, plus a fresh timing table if it could be read.
+
+    Raises on any calendar scraping problem. A timetable problem is not fatal: timing falls back to
+    the cached table, or to all-day events.
+    """
     today = datetime.date.today()
     horizon = today + datetime.timedelta(days=days)
     http = login(acc["username"], acc["password"])
@@ -231,27 +311,42 @@ def fetch_account(acc: Dict[str, Any], days: int) -> List[Event]:
         event = to_event(acc["name"], exam)
         if event and today <= event.when <= horizon:
             events.append(event)
-    return events
+
+    fresh: Optional[Dict[str, Any]] = None
+    try:
+        fresh = fetch_timing(http)
+    except Exception as exc:
+        logger.warning(
+            "%s: timetable unusable (%s: %s); %s", acc["name"], type(exc).__name__, exc,
+            "using cached bell table" if cached else "events stay all-day",
+        )
+    apply_timing(events, fresh or cached)
+    return events, fresh
 
 
 # name -> (error message, page snippet)
 Failures = Dict[str, Tuple[str, str]]
 
 
-def fetch_all(accounts: List[Dict[str, Any]], days: int) -> Tuple[Dict[str, List[Event]], Failures]:
+def fetch_all(
+    accounts: List[Dict[str, Any]], days: int, cache: Dict[str, Any]
+) -> Tuple[Dict[str, List[Event]], Failures, Dict[str, Any]]:
     """Per-account isolation: one broken account never blocks the others."""
     by_account: Dict[str, List[Event]] = {}
     failures: Failures = {}
+    fresh_timing: Dict[str, Any] = {}
     for acc in accounts:
         try:
-            by_account[acc["name"]] = fetch_account(acc, days)
+            by_account[acc["name"]], fresh = fetch_account(acc, days, cache.get(acc["name"]))
+            if fresh:
+                fresh_timing[acc["name"]] = fresh
         except ScrapeError as exc:
             failures[acc["name"]] = (str(exc), exc.snippet)
         except Exception as exc:
             failures[acc["name"]] = (f"{type(exc).__name__}: {exc}", "")
         if acc["name"] in failures:
             logger.error("Account %s failed: %s", acc["name"], failures[acc["name"]][0])
-    return by_account, failures
+    return by_account, failures, fresh_timing
 
 
 # --- filter -----------------------------------------------------------------
@@ -264,13 +359,14 @@ def keep(event: Event, exclude: List[str]) -> bool:
 # --- state + diff -----------------------------------------------------------
 
 # state.json: {"events": {key: {"seq", "hash", "cancelled", "sent", "event": snapshot}},
-#              "health": {account: {"failures", "since", "error", "last_alert"}}}
+#              "health": {account: {"failures", "since", "error", "last_alert"}},
+#              "timing": {account: {"table": {lesson: "HH:MM-HH:MM"}, "grid": {"weekday|lesson": [subjects]}}}}
 Doc = Dict[str, Dict[str, Any]]
 
 
 def load_state(path: pathlib.Path) -> Doc:
     raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return {"events": raw.get("events", {}), "health": raw.get("health", {})}
+    return {"events": raw.get("events", {}), "health": raw.get("health", {}), "timing": raw.get("timing", {})}
 
 
 def save_state(path: pathlib.Path, doc: Doc) -> None:
@@ -320,6 +416,7 @@ def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Opt
         elif entry["cancelled"]:
             changes.append(("new", e, entry["seq"] + 1))  # reappeared: re-issue with a newer sequence
         elif entry["hash"] != e.content_hash:
+            e.start, e.end = entry["event"].get("start", ""), entry["event"].get("end", "")  # keep what was sent
             changes.append(("update", e, entry["seq"] + 1))
 
     for key, entry in events_state.items():
@@ -427,6 +524,12 @@ def _fold(line: str) -> str:
     return "\r\n".join(out)
 
 
+def _utc(day: datetime.date, hhmm: str) -> str:
+    """Warsaw wall-clock time -> UTC iCalendar stamp (DST handled by zoneinfo)."""
+    local = datetime.datetime(day.year, day.month, day.day, int(hhmm[:2]), int(hhmm[3:]), tzinfo=WARSAW)
+    return local.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def build_ics(event: Event, sender: str, attendees: List[str], method: str = "REQUEST", sequence: int = 0) -> str:
     """A one-event iCalendar message so Gmail shows it as an invitation (or cancellation)."""
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -440,8 +543,11 @@ def build_ics(event: Event, sender: str, attendees: List[str], method: str = "RE
         "BEGIN:VEVENT",
         f"UID:{event.key}@librus-sync",
         f"DTSTAMP:{stamp}",
-        f"DTSTART;VALUE=DATE:{event.when:%Y%m%d}",
-        f"DTEND;VALUE=DATE:{end:%Y%m%d}",
+        *(
+            [f"DTSTART:{_utc(event.when, event.start)}", f"DTEND:{_utc(event.when, event.end)}"]
+            if event.start
+            else [f"DTSTART;VALUE=DATE:{event.when:%Y%m%d}", f"DTEND;VALUE=DATE:{end:%Y%m%d}"]
+        ),
         f"SUMMARY:{_esc(f'{event.account} - {event.what}')}",
         f"DESCRIPTION:{_esc(description)}",
         f"SEQUENCE:{sequence}",
@@ -462,7 +568,11 @@ def gcal_link(event: Event) -> str:
     params = {
         "action": "TEMPLATE",
         "text": f"{event.account} - {event.what}",
-        "dates": f"{event.when:%Y%m%d}/{end:%Y%m%d}",
+        "dates": (
+            f"{_utc(event.when, event.start)}/{_utc(event.when, event.end)}"
+            if event.start
+            else f"{event.when:%Y%m%d}/{end:%Y%m%d}"
+        ),
         "details": (event.when_detail + "\n" if event.when_detail else "") + event.details,
     }
     if event.classroom:
@@ -561,9 +671,10 @@ def main() -> None:
         return
 
     now = datetime.datetime.now()
-    by_account, failures = fetch_all(cfg["accounts"], args.days)
     doc = load_state(args.state)
     events_state, health = doc["events"], doc["health"]
+    by_account, failures, fresh_timing = fetch_all(cfg["accounts"], args.days, doc["timing"])
+    doc["timing"].update(fresh_timing)  # persisted by whichever save_state runs below
 
     # An account that suddenly returns nothing while we track upcoming events is broken, not empty.
     for name, evs in list(by_account.items()):
@@ -591,8 +702,8 @@ def main() -> None:
     changes = [c for c in diff(events, events_state, args.days, skip=set(failures)) if c[1].account in recipients]
     alerts = plan_alerts(health, failures, list(by_account), now)
     counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel")}
-    logger.info("%d fetched, %d after filter: %s; %d failing account(s), %d alert(s)",
-                len(fetched), len(events), counts, len(failures), len(alerts))
+    logger.info("%d fetched (%d timed), %d after filter: %s; %d failing account(s), %d alert(s)",
+                len(fetched), sum(1 for e in fetched if e.start), len(events), counts, len(failures), len(alerts))
     if failures and not admin:
         logger.error("Accounts are failing but no 'admin' address is configured; nobody will be told.")
 
