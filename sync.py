@@ -12,7 +12,8 @@ message is ever marked as read. Pipeline:
 The diff yields three kinds of mail, all keyed by a stable UID so the
 calendar updates the same entry instead of duplicating it:
     new     METHOD:REQUEST, SEQUENCE 0
-    update  METHOD:REQUEST, SEQUENCE+1   (description/teacher/room/... changed)
+    update  METHOD:REQUEST, SEQUENCE+1   (description/teacher/room/... changed, or an all-day
+                                          entry gained a confident time; never the reverse)
     cancel  METHOD:CANCEL,  SEQUENCE+1   (gone from Librus, still in the window)
     move    METHOD:REQUEST, SEQUENCE+1   (same event on a new date/lesson, old UID kept)
 
@@ -461,11 +462,14 @@ def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Opt
         elif entry["cancelled"]:
             e.uid = entry["event"].get("uid", "")
             changes.append(("new", e, entry["seq"] + 1))  # reappeared: re-issue with a newer sequence
-        elif entry["hash"] != e.content_hash:
-            e.uid = entry["event"].get("uid", "")
-            if e.interval == entry["event"].get("interval", ""):
-                # times derive from the lesson: keep what was sent. An edited explicit range is real news.
-                e.start, e.end = entry["event"].get("start", ""), entry["event"].get("end", "")
+        elif entry["hash"] != e.content_hash or (e.start and not entry["event"].get("start")):
+            old = entry["event"]
+            e.uid = old.get("uid", "")
+            if old.get("start") and e.interval == old.get("interval", ""):
+                # Times derive from the lesson: once sent, keep them. An edited explicit range is real news.
+                e.start, e.end = old["start"], old.get("end", "")
+            if entry["hash"] == e.content_hash:
+                e.was = "all-day"  # nothing changed in Librus; the event merely gained a time
             changes.append(("update", e, entry["seq"] + 1))
 
     for key, entry in events_state.items():
@@ -640,7 +644,7 @@ def build_message(change: Change, sender: str, to: List[str], test: bool = False
     when = f"{event.when:%A, %Y-%m-%d}" + (f" ({event.when_detail})" if event.when_detail else "")
     body = (
         f"{'This event was removed from Librus.' + chr(10) if cancel else ''}"
-        f"{'This event was changed in Librus.' + chr(10) if action == 'update' else ''}"
+        f"{('This event now has a time (it was an all-day entry).' if event.was else 'This event was changed in Librus.') + chr(10) if action == 'update' else ''}"
         f"{'This event was moved in Librus.' + chr(10) + 'Was:     ' + event.was + chr(10) if action == 'move' else ''}"
         f"What:    {event.account} - {event.what}\n"
         f"When:    {when}\n"
