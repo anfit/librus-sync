@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Email upcoming Librus calendar events as .ics invitations, and keep Google
-Calendar in step when they change or disappear.
+Email upcoming Librus calendar events as .ics invitations, keep Google
+Calendar in step when they change or disappear, and tell the admin when the
+scraper stops working.
 
 Read-only towards Librus: only calendar (terminarz) pages are fetched, so no
 message is ever marked as read. Pipeline:
 
-    fetch -> filter (drop absences etc.) -> diff against state.json -> email
+    fetch (per account) -> filter (drop absences etc.) -> diff against state -> email
 
 The diff yields three kinds of mail, all keyed by a stable UID so the
 calendar updates the same entry instead of duplicating it:
     new     METHOD:REQUEST, SEQUENCE 0
     update  METHOD:REQUEST, SEQUENCE+1   (description/teacher/room/... changed)
     cancel  METHOD:CANCEL,  SEQUENCE+1   (gone from Librus, still in the window)
+
+Librus has no public API, so scraping will break eventually. A failing account
+is isolated (the others still run, and its events are never cancelled), and
+the admin is emailed on first failure, again at most daily, and on recovery.
 
 Each event is reduced to what / when / details. Without --send nothing is
 emailed and the state is not touched (dry run).
@@ -26,6 +31,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import smtplib
 import ssl
 import sys
@@ -44,8 +50,21 @@ logger = logging.getLogger(__name__)
 HERE = pathlib.Path(__file__).resolve().parent
 CONFIG_CANDIDATES = [HERE / "config.yml", HERE / "config.yaml"]
 DEFAULT_STATE = HERE / "state.json"
+CALENDAR_URL = "https://synergia.librus.pl/terminarz"
 # Categories/subjects containing any of these (case-insensitive) are skipped.
 DEFAULT_EXCLUDE = ["nieobecn", "absen"]
+# An account returning nothing while at least this many tracked events are
+# upcoming is treated as a broken scraper, not as "everything was removed".
+SUSPICIOUS_EMPTY_MIN_TRACKED = 3
+REALERT_AFTER = datetime.timedelta(hours=24)
+
+
+class ScrapeError(Exception):
+    """Librus answered, but not with the page we expect (access denied, layout changed)."""
+
+    def __init__(self, message: str, snippet: str = "") -> None:
+        super().__init__(message)
+        self.snippet = snippet
 
 
 @dataclass
@@ -124,11 +143,11 @@ def load_config(path: pathlib.Path) -> Dict[str, Any]:
         }
         for item in raw.get("accounts", [])
     ]
+    if not accounts:
+        raise SystemExit(f"No accounts in {path}")
     for acc in accounts:
         if not acc["recipients"]:
             raise SystemExit(f"Account {acc['name']} has no recipients")
-    if not accounts:
-        raise SystemExit(f"No accounts in {path}")
     raw["accounts"] = accounts
     return raw
 
@@ -172,29 +191,67 @@ def to_event(account: str, exam: librus.Exam) -> Optional[Event]:
     )
 
 
-def login(username: str, password: str) -> librus.LibrusSession:
-    """Log in with librus_pyapi (current auth flow), scrape with librus (calendar parser)."""
+def login(username: str, password: str) -> requests_html.HTMLSession:
+    """Log in with librus_pyapi (current auth flow); hand the cookies to an HTML session."""
     authed = LibrusAPI(username, password).session
     html = requests_html.HTMLSession()
     html.cookies.update(authed.cookies)
-    session = librus.LibrusSession()
-    session._html_session = html
-    return session
+    return html
 
 
-def fetch_upcoming(accounts: List[Dict[str, str]], days: int) -> List[Event]:
-    """Returns events; raises if any account failed, so a partial run never changes state."""
+def _snippet(page: Any) -> str:
+    return re.sub(r"\s+", " ", page.html.text or "").strip()[:300]
+
+
+def check_calendar_page(page: Any) -> None:
+    """Distinguish 'no events' from 'page is not the calendar'."""
+    if "Brak dostępu" in page.text:
+        raise ScrapeError("access denied (Librus answered 'Brak dostępu')", _snippet(page))
+    if not page.html.find("table.kalendarz") or not page.html.find(".kalendarz-dzien"):
+        raise ScrapeError("calendar markup not found (layout changed?)", _snippet(page))
+
+
+def fetch_account(acc: Dict[str, Any], days: int) -> List[Event]:
+    """All events of one account within the window. Raises on any scraping problem."""
     today = datetime.date.today()
     horizon = today + datetime.timedelta(days=days)
+    http = login(acc["username"], acc["password"])
+    page = http.get(CALENDAR_URL)
+    page.raise_for_status()
+    check_calendar_page(page)
+
     events: List[Event] = []
-    for acc in accounts:
-        session = login(acc["username"], acc["password"])
-        for exam in session.list_exams():
-            event = to_event(acc["name"], exam)
-            if event and today <= event.when <= horizon:
-                events.append(event)
-    events.sort(key=lambda e: (e.when, e.account, e.what))
+    for (event_id,) in page.html.search_all("szczegoly/{}'"):
+        details = http.get(f"{CALENDAR_URL}/szczegoly/{event_id}")
+        details.raise_for_status()
+        try:
+            exam = librus.LibrusSession._parse_exam(details.html.find("table.decorated.medium"))
+        except Exception as exc:  # parser asserts/IndexErrors mean the layout changed
+            raise ScrapeError(f"could not parse event {event_id}: {type(exc).__name__}: {exc}", _snippet(details)) from exc
+        event = to_event(acc["name"], exam)
+        if event and today <= event.when <= horizon:
+            events.append(event)
     return events
+
+
+# name -> (error message, page snippet)
+Failures = Dict[str, Tuple[str, str]]
+
+
+def fetch_all(accounts: List[Dict[str, Any]], days: int) -> Tuple[Dict[str, List[Event]], Failures]:
+    """Per-account isolation: one broken account never blocks the others."""
+    by_account: Dict[str, List[Event]] = {}
+    failures: Failures = {}
+    for acc in accounts:
+        try:
+            by_account[acc["name"]] = fetch_account(acc, days)
+        except ScrapeError as exc:
+            failures[acc["name"]] = (str(exc), exc.snippet)
+        except Exception as exc:
+            failures[acc["name"]] = (f"{type(exc).__name__}: {exc}", "")
+        if acc["name"] in failures:
+            logger.error("Account %s failed: %s", acc["name"], failures[acc["name"]][0])
+    return by_account, failures
 
 
 # --- filter -----------------------------------------------------------------
@@ -206,25 +263,24 @@ def keep(event: Event, exclude: List[str]) -> bool:
 
 # --- state + diff -----------------------------------------------------------
 
-# state.json: {"events": {key: {"seq": int, "hash": str, "cancelled": bool,
-#                               "sent": iso timestamp, "event": snapshot}}}
-State = Dict[str, Dict[str, Any]]
+# state.json: {"events": {key: {"seq", "hash", "cancelled", "sent", "event": snapshot}},
+#              "health": {account: {"failures", "since", "error", "last_alert"}}}
+Doc = Dict[str, Dict[str, Any]]
 
 
-def load_state(path: pathlib.Path) -> State:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8")).get("events", {})
+def load_state(path: pathlib.Path) -> Doc:
+    raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return {"events": raw.get("events", {}), "health": raw.get("health", {})}
 
 
-def save_state(path: pathlib.Path, state: State) -> None:
+def save_state(path: pathlib.Path, doc: Doc) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps({"events": state}, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
-def record(state: State, event: Event, seq: int, cancelled: bool = False) -> None:
-    state[event.key] = {
+def record(events_state: Dict[str, Any], event: Event, seq: int, cancelled: bool = False) -> None:
+    events_state[event.key] = {
         "seq": seq,
         "hash": event.content_hash,
         "cancelled": cancelled,
@@ -237,14 +293,28 @@ def record(state: State, event: Event, seq: int, cancelled: bool = False) -> Non
 Change = Tuple[str, Event, int]
 
 
-def diff(events: List[Event], state: State, days: int) -> List[Change]:
+def tracked_upcoming(events_state: Dict[str, Any], account: str, days: int) -> int:
+    today = datetime.date.today()
+    horizon = today + datetime.timedelta(days=days)
+    count = 0
+    for entry in events_state.values():
+        snap = entry["event"]
+        if snap["account"] == account and not entry["cancelled"]:
+            if today <= datetime.date.fromisoformat(snap["when"]) <= horizon:
+                count += 1
+    return count
+
+
+def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Optional[set] = None) -> List[Change]:
+    """`skip` holds accounts whose fetch failed: nothing is concluded about them."""
+    skip = skip or set()
     today = datetime.date.today()
     horizon = today + datetime.timedelta(days=days)
     changes: List[Change] = []
-    current = {e.key: e for e in events}
+    current = {e.key: e for e in events if e.account not in skip}
 
     for key, e in current.items():
-        entry = state.get(key)
+        entry = events_state.get(key)
         if entry is None:
             changes.append(("new", e, 0))
         elif entry["cancelled"]:
@@ -252,13 +322,85 @@ def diff(events: List[Event], state: State, days: int) -> List[Change]:
         elif entry["hash"] != e.content_hash:
             changes.append(("update", e, entry["seq"] + 1))
 
-    for key, entry in state.items():
-        if key in current or entry["cancelled"]:
+    for key, entry in events_state.items():
+        if key in current or entry["cancelled"] or entry["event"]["account"] in skip:
             continue
         old = Event.from_snapshot(entry["event"])
         if today <= old.when <= horizon:  # only judge events the fetch could actually have seen
             changes.append(("cancel", old, entry["seq"] + 1))
     return changes
+
+
+# --- alerts -----------------------------------------------------------------
+
+@dataclass
+class Alert:
+    kind: str            # "failing" | "recovered"
+    account: str
+    error: str
+    snippet: str
+    failures: int
+    since: str
+
+
+def plan_alerts(health: Dict[str, Any], failures: Failures, ok: List[str], now: datetime.datetime) -> List[Alert]:
+    """Alert on first failure, at most daily while it persists, and once on recovery."""
+    alerts: List[Alert] = []
+    for account, (error, snippet) in failures.items():
+        entry = health.get(account)
+        last = datetime.datetime.fromisoformat(entry["last_alert"]) if entry and entry.get("last_alert") else None
+        count = (entry["failures"] if entry else 0) + 1
+        since = entry["since"] if entry else now.isoformat(timespec="seconds")
+        if last is None or now - last >= REALERT_AFTER:
+            alerts.append(Alert("failing", account, error, snippet, count, since))
+    for account in ok:
+        entry = health.get(account)
+        if entry:
+            alerts.append(Alert("recovered", account, entry.get("error", ""), "", entry["failures"], entry["since"]))
+    return alerts
+
+
+def note_failures(health: Dict[str, Any], failures: Failures, now: datetime.datetime) -> None:
+    for account, (error, _) in failures.items():
+        entry = health.setdefault(account, {"failures": 0, "since": now.isoformat(timespec="seconds")})
+        entry["failures"] += 1
+        entry["error"] = error
+
+
+def scrub(text: str, secrets: List[str]) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def build_alert(alert: Alert, sender: str, admin: str, secrets: List[str]) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = admin
+    if alert.kind == "recovered":
+        msg["Subject"] = f"[librus-sync] RECOVERED: {alert.account}"
+        body = (
+            f"Account {alert.account} works again.\n"
+            f"It had failed {alert.failures} consecutive run(s) since {alert.since}.\n"
+            f"Last error was: {alert.error}\n"
+        )
+    else:
+        msg["Subject"] = f"[librus-sync] FAILING: {alert.account}"
+        body = (
+            f"Account {alert.account} could not be read from Librus.\n\n"
+            f"Error:   {alert.error}\n"
+            f"Since:   {alert.since} ({alert.failures} consecutive run(s))\n"
+        )
+        if alert.snippet:
+            body += f"\nPage said (first 300 chars):\n  {alert.snippet}\n"
+        body += (
+            "\nWhile this lasts, the account's events are neither sent nor cancelled; "
+            "other accounts keep working. Likely causes: Librus changed its login or the "
+            "calendar layout, or the credentials changed. You get at most one reminder a day.\n"
+        )
+    msg.set_content(scrub(body, secrets))
+    return msg
 
 
 # --- ics + email ------------------------------------------------------------
@@ -398,35 +540,62 @@ def main() -> None:
         help="send ONE notification (the first pending change, see --test-index) to ADDR only; state is untouched",
     )
     parser.add_argument("--test-index", type=int, default=1, help="which pending change --test-to sends (1-based)")
+    parser.add_argument("--test-alert", metavar="ADDR", help="send a sample FAILING alert to ADDR and exit; state is untouched")
     parser.add_argument("--baseline", action="store_true", help="mark all current events as seen without emailing")
-    parser.add_argument("--force", action="store_true", help="allow cancelling when Librus returned no events at all")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
     cfg = load_config(find_config(args.config))
     exclude = cfg.get("exclude", DEFAULT_EXCLUDE)
     recipients = {acc["name"]: acc["recipients"] for acc in cfg["accounts"]}
+    secrets = [s for acc in cfg["accounts"] for s in (acc["username"], acc["password"])]
+    sender = cfg["email"]["sender"]
+    admin = cfg.get("admin")
 
-    fetched = fetch_upcoming(cfg["accounts"], args.days)
+    if args.test_alert:
+        sample = Alert("failing", "TEST", "sample error: this is only a test of the alert path",
+                       "Brak dostępu (sample page text)", 1, datetime.datetime.now().isoformat(timespec="seconds"))
+        with Mailer(cfg["email"]) as mailer:
+            mailer.send(build_alert(sample, sender, args.test_alert, secrets))
+        logger.info("Sample alert sent to %s", args.test_alert)
+        return
+
+    now = datetime.datetime.now()
+    by_account, failures = fetch_all(cfg["accounts"], args.days)
+    doc = load_state(args.state)
+    events_state, health = doc["events"], doc["health"]
+
+    # An account that suddenly returns nothing while we track upcoming events is broken, not empty.
+    for name, evs in list(by_account.items()):
+        tracked = tracked_upcoming(events_state, name, args.days)
+        if not evs and tracked >= SUSPICIOUS_EMPTY_MIN_TRACKED:
+            failures[name] = (f"calendar returned no events, but {tracked} tracked events are upcoming", "")
+            del by_account[name]
+            logger.error("Account %s failed: %s", name, failures[name][0])
+
+    fetched = [e for evs in by_account.values() for e in evs]
+    fetched.sort(key=lambda e: (e.when, e.account, e.what))
     events = [e for e in fetched if keep(e, exclude)]
-    state = load_state(args.state)
 
     if args.baseline:
+        if failures:
+            logger.error("Baseline incomplete (%s failed); nothing saved so the next run retries.", ", ".join(failures))
+            raise SystemExit(1)
         for e in events:
-            if e.key not in state:
-                record(state, e, 0)
-        save_state(args.state, state)
+            if e.key not in events_state:
+                record(events_state, e, 0)
+        save_state(args.state, doc)
         logger.info("Baseline saved: %d events marked as seen", len(events))
         return
 
-    changes = [c for c in diff(events, state, args.days) if c[1].account in recipients]
+    changes = [c for c in diff(events, events_state, args.days, skip=set(failures)) if c[1].account in recipients]
+    alerts = plan_alerts(health, failures, list(by_account), now)
     counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel")}
-    logger.info("%d fetched, %d after filter: %s", len(fetched), len(events), counts)
+    logger.info("%d fetched, %d after filter: %s; %d failing account(s), %d alert(s)",
+                len(fetched), len(events), counts, len(failures), len(alerts))
+    if failures and not admin:
+        logger.error("Accounts are failing but no 'admin' address is configured; nobody will be told.")
 
-    if counts["cancel"] and not events and not args.force:
-        raise SystemExit("Librus returned no events but cancellations are pending; refusing (use --force).")
-
-    sender = cfg["email"]["sender"]
     if args.test_to:
         if not 1 <= args.test_index <= len(changes):
             raise SystemExit(f"--test-index {args.test_index} out of range ({len(changes)} pending change(s))")
@@ -442,26 +611,41 @@ def main() -> None:
             action, e, _ = change
             path = args.outbox / f"{i:02d}_{action}_{e.when:%Y-%m-%d}_{e.account}.eml"
             path.write_bytes(bytes(build_message(change, sender, recipients[e.account])))
-        logger.info("Wrote %d .eml file(s) to %s", len(changes), args.outbox)
-        return
-
-    if not args.send:
+        for i, alert in enumerate(alerts, 1):
+            path = args.outbox / f"alert{i:02d}_{alert.kind}_{alert.account}.eml"
+            path.write_bytes(bytes(build_alert(alert, sender, admin or "(no admin)", secrets)))
+        logger.info("Wrote %d .eml file(s) to %s", len(changes) + len(alerts), args.outbox)
+    elif not args.send:
         for action, e, seq in changes:
             print(f"{action.upper():6} [{e.account}] {e.what}  (seq {seq})")
             print(f"  to:      {', '.join(recipients[e.account])}")
             print(f"  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
-        print(f"DRY RUN: {len(changes)} email(s) would be sent")
-        return
+        for a in alerts:
+            print(f"ALERT  {a.kind.upper()} [{a.account}] {a.error}  -> {admin}")
+        print(f"DRY RUN: {len(changes)} email(s) and {len(alerts)} alert(s) would be sent")
+    else:
+        note_failures(health, failures, now)
+        save_state(args.state, doc)  # count failures even if sending below fails
+        if changes or alerts:
+            with Mailer(cfg["email"]) as mailer:
+                for alert in alerts:
+                    if admin:
+                        mailer.send(build_alert(alert, sender, admin, secrets))
+                    if alert.kind == "recovered":
+                        health.pop(alert.account, None)
+                    elif admin:
+                        health[alert.account]["last_alert"] = now.isoformat(timespec="seconds")
+                    save_state(args.state, doc)
+                    logger.info("Alert %s: %s", alert.kind, alert.account)
+                for change in changes:
+                    action, e, seq = change
+                    mailer.send(build_message(change, sender, recipients[e.account]))
+                    record(events_state, e, seq, cancelled=action == "cancel")
+                    save_state(args.state, doc)  # per email, so a crash never re-sends
+                    logger.info("Sent %s: [%s] %s %s", action, e.account, e.when, e.what)
 
-    if not changes:
-        return
-    with Mailer(cfg["email"]) as mailer:
-        for change in changes:
-            action, e, seq = change
-            mailer.send(build_message(change, sender, recipients[e.account]))
-            record(state, e, seq, cancelled=action == "cancel")
-            save_state(args.state, state)  # per email, so a crash never re-sends
-            logger.info("Sent %s: [%s] %s %s", action, e.account, e.when, e.what)
+    if failures:
+        raise SystemExit(1)  # the deployer's status shows the unit as failed
 
 
 if __name__ == "__main__":
