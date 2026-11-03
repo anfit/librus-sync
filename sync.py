@@ -21,6 +21,9 @@ Librus has no public API, so scraping will break eventually. A failing account
 is isolated (the others still run, and its events are never cancelled), and
 the admin is emailed on first failure, again at most daily, and on recovery.
 
+Unread inbox messages are announced in a digest (sender, subject, date - never the text). Only the
+inbox LIST endpoint is used: opening a message would mark it as read, so no code path may fetch one.
+
 Each event is reduced to what / when / details. Without --send nothing is
 emailed and the state is not touched (dry run).
 """
@@ -56,6 +59,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 CONFIG_CANDIDATES = [HERE / "config.yml", HERE / "config.yaml"]
 DEFAULT_STATE = HERE / "state.json"
 CALENDAR_URL = "https://synergia.librus.pl/terminarz"
+# The ONLY messages endpoint this tool may call. Fetching a single message (.../messages/<id>)
+# marks it as read; the list below does not (verified: unread counts stay unchanged).
+INBOX_LIST_URL = "https://wiadomosci.librus.pl/api/inbox/messages"
+MAX_MESSAGE_PAGES = 20
 # Categories/subjects containing any of these (case-insensitive) are skipped.
 DEFAULT_EXCLUDE = ["nieobecn", "absen"]
 # An account returning nothing while at least this many tracked events are
@@ -216,12 +223,12 @@ def to_event(account: str, exam: librus.Exam) -> Optional[Event]:
     )
 
 
-def login(username: str, password: str) -> requests_html.HTMLSession:
-    """Log in with librus_pyapi (current auth flow); hand the cookies to an HTML session."""
-    authed = LibrusAPI(username, password).session
+def login(username: str, password: str) -> Tuple[LibrusAPI, requests_html.HTMLSession]:
+    """Log in with librus_pyapi (current auth flow); hand the cookies to an HTML session for scraping."""
+    api = LibrusAPI(username, password)
     html = requests_html.HTMLSession()
-    html.cookies.update(authed.cookies)
-    return html
+    html.cookies.update(api.session.cookies)
+    return api, html
 
 
 def _snippet(page: Any) -> str:
@@ -302,7 +309,7 @@ def apply_timing(events: List[Event], timing: Optional[Dict[str, Any]]) -> None:
 
 
 def fetch_account(
-    acc: Dict[str, Any], days: int, cached: Optional[Dict[str, Any]] = None
+    acc: Dict[str, Any], days: int, http: requests_html.HTMLSession, cached: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[Event], Optional[Dict[str, Any]]]:
     """Events of one account within the window, plus a fresh timing table if it could be read.
 
@@ -311,7 +318,6 @@ def fetch_account(
     """
     today = datetime.date.today()
     horizon = today + datetime.timedelta(days=days)
-    http = login(acc["username"], acc["password"])
     page = http.get(CALENDAR_URL)
     page.raise_for_status()
     check_calendar_page(page)
@@ -340,29 +346,77 @@ def fetch_account(
     return events, fresh
 
 
+@dataclass
+class Msg:
+    """What a digest may show. Deliberately has no body field."""
+
+    id: str
+    sender: str
+    subject: str
+    sent: str
+
+
+def fetch_unread(api: LibrusAPI) -> List[Msg]:
+    """Unread inbox messages via the list endpoint only. Never reads the 'content' snippet it returns."""
+    out: List[Msg] = []
+    returned = 0
+    for page in range(1, MAX_MESSAGE_PAGES + 1):
+        response = api.session.get(INBOX_LIST_URL, params={"unreadOnly": 1, "page": page, "limit": 50})
+        response.raise_for_status()
+        try:
+            body = response.json()
+            items, total = body["data"], int(body["total"])
+            returned += len(items)
+            for item in items:
+                if item.get("readDate") is None:  # belt and braces in case 'unreadOnly' is ever ignored
+                    out.append(Msg(str(item["messageId"]), item.get("senderName") or "", item.get("topic") or "",
+                                   item.get("sendDate") or ""))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ScrapeError(f"inbox list has an unexpected shape ({type(exc).__name__}: {exc})", response.text[:200]) from exc
+        if not items or returned >= total:
+            return out
+    return out
+
+
 # name -> (error message, page snippet)
 Failures = Dict[str, Tuple[str, str]]
 
 
 def fetch_all(
     accounts: List[Dict[str, Any]], days: int, cache: Dict[str, Any]
-) -> Tuple[Dict[str, List[Event]], Failures, Dict[str, Any]]:
-    """Per-account isolation: one broken account never blocks the others."""
+) -> Tuple[Dict[str, List[Event]], Failures, Dict[str, Any], Dict[str, List[Msg]]]:
+    """Per-account isolation: one broken account never blocks the others, and a broken inbox never blocks the calendar."""
     by_account: Dict[str, List[Event]] = {}
     failures: Failures = {}
     fresh_timing: Dict[str, Any] = {}
+    unread: Dict[str, List[Msg]] = {}
     for acc in accounts:
+        name = acc["name"]
         try:
-            by_account[acc["name"]], fresh = fetch_account(acc, days, cache.get(acc["name"]))
-            if fresh:
-                fresh_timing[acc["name"]] = fresh
-        except ScrapeError as exc:
-            failures[acc["name"]] = (str(exc), exc.snippet)
+            api, http = login(acc["username"], acc["password"])
         except Exception as exc:
-            failures[acc["name"]] = (f"{type(exc).__name__}: {exc}", "")
-        if acc["name"] in failures:
-            logger.error("Account %s failed: %s", acc["name"], failures[acc["name"]][0])
-    return by_account, failures, fresh_timing
+            failures[name] = (f"{type(exc).__name__}: {exc}", "")
+            logger.error("Account %s failed: %s", name, failures[name][0])
+            continue
+        try:
+            by_account[name], fresh = fetch_account(acc, days, http, cache.get(name))
+            if fresh:
+                fresh_timing[name] = fresh
+        except ScrapeError as exc:
+            failures[name] = (str(exc), exc.snippet)
+        except Exception as exc:
+            failures[name] = (f"{type(exc).__name__}: {exc}", "")
+        if name in failures:
+            logger.error("Account %s failed: %s", name, failures[name][0])
+        try:
+            unread[name] = fetch_unread(api)
+        except ScrapeError as exc:
+            failures[f"{name} messages"] = (str(exc), exc.snippet)
+        except Exception as exc:
+            failures[f"{name} messages"] = (f"{type(exc).__name__}: {exc}", "")
+        if f"{name} messages" in failures:
+            logger.error("Inbox of %s failed: %s", name, failures[f"{name} messages"][0])
+    return by_account, failures, fresh_timing, unread
 
 
 # --- filter -----------------------------------------------------------------
@@ -376,13 +430,14 @@ def keep(event: Event, exclude: List[str]) -> bool:
 
 # state.json: {"events": {key: {"seq", "hash", "cancelled", "sent", "event": snapshot}},
 #              "health": {account: {"failures", "since", "error", "last_alert"}},
+#              "messages": {account: {message id: iso time first seen unread}},
 #              "timing": {account: {"table": {lesson: "HH:MM-HH:MM"}, "grid": {"weekday|lesson": [subjects]}}}}
 Doc = Dict[str, Dict[str, Any]]
 
 
 def load_state(path: pathlib.Path) -> Doc:
     raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return {"events": raw.get("events", {}), "health": raw.get("health", {}), "timing": raw.get("timing", {})}
+    return {"events": raw.get("events", {}), "health": raw.get("health", {}), "timing": raw.get("timing", {}), "messages": raw.get("messages", {})}
 
 
 def save_state(path: pathlib.Path, doc: Doc) -> None:
@@ -479,6 +534,41 @@ def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Opt
         if today <= old.when <= horizon:  # only judge events the fetch could actually have seen
             changes.append(("cancel", old, entry["seq"] + 1))
     return pair_moves(changes)
+
+
+# --- message digest ---------------------------------------------------------
+
+def plan_digests(unread: Dict[str, List[Msg]], msgs_state: Dict[str, Any]) -> Tuple[List[Tuple[str, List[Msg]]], List[str]]:
+    """New unread messages per account. An account never seen before is baselined silently, not announced."""
+    digests: List[Tuple[str, List[Msg]]] = []
+    first_seen: List[str] = []
+    for name, msgs in unread.items():
+        seen = msgs_state.get(name)
+        if seen is None:
+            first_seen.append(name)
+            continue
+        new = [m for m in msgs if m.id not in seen]
+        if new:
+            digests.append((name, new))
+    return digests, first_seen
+
+
+def settle_messages(msgs_state: Dict[str, Any], name: str, msgs: List[Msg], now: datetime.datetime) -> None:
+    """Remember what is currently unread (keeps first-seen times, forgets messages that were read meanwhile)."""
+    known = msgs_state.get(name, {})
+    msgs_state[name] = {m.id: known.get(m.id, now.isoformat(timespec="seconds")) for m in msgs}
+
+
+def build_digest(account: str, new: List[Msg], sender: str, to: List[str]) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to)
+    msg["Subject"] = f"[{account}] {len(new)} new Librus message{'s' if len(new) != 1 else ''}"
+    lines = [f"{account} has {len(new)} new unread message{'s' if len(new) != 1 else ''} in Librus:", ""]
+    lines += [f"- From: {m.sender or '(unknown)'}\n  Subject: {m.subject or '(no subject)'}\n  Sent: {m.sent[:16]}" for m in new]
+    lines += ["", "The messages were not opened, so they are still unread in Librus."]
+    msg.set_content("\n".join(lines) + "\n")
+    return msg
 
 
 # --- alerts -----------------------------------------------------------------
@@ -727,7 +817,8 @@ def main() -> None:
     now = datetime.datetime.now()
     doc = load_state(args.state)
     events_state, health = doc["events"], doc["health"]
-    by_account, failures, fresh_timing = fetch_all(cfg["accounts"], args.days, doc["timing"])
+    msgs_state = doc["messages"]
+    by_account, failures, fresh_timing, unread = fetch_all(cfg["accounts"], args.days, doc["timing"])
     doc["timing"].update(fresh_timing)  # persisted by whichever save_state runs below
 
     # An account that suddenly returns nothing while we track upcoming events is broken, not empty.
@@ -749,15 +840,19 @@ def main() -> None:
         for e in events:
             if e.key not in events_state:
                 record(events_state, e, 0)
+        for name, msgs in unread.items():
+            settle_messages(msgs_state, name, msgs, now)
         save_state(args.state, doc)
-        logger.info("Baseline saved: %d events marked as seen", len(events))
+        logger.info("Baseline saved: %d events and %d unread messages marked as seen", len(events), sum(map(len, unread.values())))
         return
 
     changes = [c for c in diff(events, events_state, args.days, skip=set(failures)) if c[1].account in recipients]
-    alerts = plan_alerts(health, failures, list(by_account), now)
+    digests, first_seen = plan_digests(unread, msgs_state)
+    alerts = plan_alerts(health, failures, list(by_account) + [f"{n} messages" for n in unread], now)
     counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel", "move")}
-    logger.info("%d fetched (%d timed), %d after filter: %s; %d failing account(s), %d alert(s)",
-                len(fetched), sum(1 for e in fetched if e.start), len(events), counts, len(failures), len(alerts))
+    logger.info("%d fetched (%d timed), %d after filter: %s; %d digest(s), %d inbox(es) to baseline; %d failing, %d alert(s)",
+                len(fetched), sum(1 for e in fetched if e.start), len(events), counts, len(digests), len(first_seen),
+                len(failures), len(alerts))
     if failures and not admin:
         logger.error("Accounts are failing but no 'admin' address is configured; nobody will be told.")
 
@@ -776,22 +871,34 @@ def main() -> None:
             action, e, _ = change
             path = args.outbox / f"{i:02d}_{action}_{e.when:%Y-%m-%d}_{e.account}.eml"
             path.write_bytes(bytes(build_message(change, sender, recipients[e.account])))
+        for name, new in digests:
+            (args.outbox / f"digest_{name}.eml").write_bytes(bytes(build_digest(name, new, sender, recipients[name])))
         for i, alert in enumerate(alerts, 1):
             path = args.outbox / f"alert{i:02d}_{alert.kind}_{alert.account}.eml"
             path.write_bytes(bytes(build_alert(alert, sender, admin or "(no admin)", secrets)))
-        logger.info("Wrote %d .eml file(s) to %s", len(changes) + len(alerts), args.outbox)
+        logger.info("Wrote %d .eml file(s) to %s", len(changes) + len(digests) + len(alerts), args.outbox)
     elif not args.send:
         for action, e, seq in changes:
             print(f"{action.upper():6} [{e.account}] {e.what}  (seq {seq})")
             print(f"  to:      {', '.join(recipients[e.account])}")
             print(f"  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
+        for name, new in digests:
+            print(f"DIGEST [{name}] {len(new)} new message(s)  to: {', '.join(recipients[name])}")
+            for m in new:
+                print(f"  - {m.sender}: {m.subject}  ({m.sent[:16]})")
+        for name in first_seen:
+            print(f"MESSAGES [{name}] first run: {len(unread[name])} unread would be recorded silently")
         for a in alerts:
             print(f"ALERT  {a.kind.upper()} [{a.account}] {a.error}  -> {admin}")
-        print(f"DRY RUN: {len(changes)} email(s) and {len(alerts)} alert(s) would be sent")
+        print(f"DRY RUN: {len(changes)} event email(s), {len(digests)} digest(s) and {len(alerts)} alert(s) would be sent")
     else:
         note_failures(health, failures, now)
+        pending = {name for name, _ in digests}
+        for name, msgs in unread.items():
+            if name not in pending:  # baseline silently / forget messages read meanwhile
+                settle_messages(msgs_state, name, msgs, now)
         save_state(args.state, doc)  # count failures even if sending below fails
-        if changes or alerts:
+        if changes or alerts or digests:
             with Mailer(cfg["email"]) as mailer:
                 for alert in alerts:
                     if admin:
@@ -802,6 +909,11 @@ def main() -> None:
                         health[alert.account]["last_alert"] = now.isoformat(timespec="seconds")
                     save_state(args.state, doc)
                     logger.info("Alert %s: %s", alert.kind, alert.account)
+                for name, new in digests:
+                    mailer.send(build_digest(name, new, sender, recipients[name]))
+                    settle_messages(msgs_state, name, unread[name], now)
+                    save_state(args.state, doc)
+                    logger.info("Sent digest: [%s] %d new message(s)", name, len(new))
                 for change in changes:
                     action, e, seq = change
                     mailer.send(build_message(change, sender, recipients[e.account]))
