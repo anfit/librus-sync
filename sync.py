@@ -554,6 +554,20 @@ def plan_digests(unread: Dict[str, List[Msg]], msgs_state: Dict[str, Any]) -> Tu
     return digests, first_seen
 
 
+def sample_digests(unread: Dict[str, List[Msg]], now: datetime.datetime) -> List[Tuple[str, List[Msg], Optional[str]]]:
+    """For previewing: one single-message digest and one several-message digest from real unread messages."""
+    samples: List[Tuple[str, List[Msg], Optional[str]]] = []
+    for name, msgs in unread.items():
+        if msgs:
+            samples.append((name, msgs[:1], None))
+            break
+    richest = max(unread.items(), key=lambda kv: len(kv[1]), default=None)
+    if richest and len(richest[1]) >= 2:
+        since = (now - datetime.timedelta(hours=6)).isoformat(timespec="seconds")
+        samples.append((richest[0], richest[1][:3], since))
+    return samples
+
+
 def settle_messages(doc: Doc, name: str, msgs: List[Msg], now: datetime.datetime) -> None:
     """Remember what is currently unread (keeps first-seen times, forgets messages that were read meanwhile)
     and stamp the check time that the next digest's 'since' refers to."""
@@ -809,6 +823,10 @@ def main() -> None:
     )
     parser.add_argument("--test-index", type=int, default=1, help="which pending change --test-to sends (1-based)")
     parser.add_argument("--test-alert", metavar="ADDR", help="send a sample FAILING alert to ADDR and exit; state is untouched")
+    parser.add_argument(
+        "--test-digest", metavar="ADDR",
+        help="send sample digests (both subject formats) built from REAL unread messages to ADDR only; state untouched",
+    )
     parser.add_argument("--baseline", action="store_true", help="mark all current events as seen without emailing")
     args = parser.parse_args()
 
@@ -835,6 +853,18 @@ def main() -> None:
     last_checked = dict(doc["checked"])  # as of the previous run, for the digest subjects
     by_account, failures, fresh_timing, unread = fetch_all(cfg["accounts"], args.days, doc["timing"])
     doc["timing"].update(fresh_timing)  # persisted by whichever save_state runs below
+
+    if args.test_digest:
+        samples = sample_digests(unread, now)
+        if not samples:
+            raise SystemExit("No unread messages to build a sample from.")
+        with Mailer(cfg["email"]) as mailer:
+            for name, new, since in samples:
+                msg = build_digest(name, new, sender, [args.test_digest], since)
+                msg.replace_header("Subject", "[TEST] " + msg["Subject"])
+                mailer.send(msg)
+                logger.info("Sample digest sent to %s: %s, %d message(s) (state untouched)", args.test_digest, name, len(new))
+        return
 
     # An account that suddenly returns nothing while we track upcoming events is broken, not empty.
     for name, evs in list(by_account.items()):
