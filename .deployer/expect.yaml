@@ -1,4 +1,4 @@
 commands:
   python3:
-    version: ">=3.10,<3.14"
+    version: ">=3.10"
   sha256sum: {}
