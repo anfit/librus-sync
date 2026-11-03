@@ -431,13 +431,14 @@ def keep(event: Event, exclude: List[str]) -> bool:
 # state.json: {"events": {key: {"seq", "hash", "cancelled", "sent", "event": snapshot}},
 #              "health": {account: {"failures", "since", "error", "last_alert"}},
 #              "messages": {account: {message id: iso time first seen unread}},
+#              "checked": {account: iso time of the last inbox check that was fully handled},
 #              "timing": {account: {"table": {lesson: "HH:MM-HH:MM"}, "grid": {"weekday|lesson": [subjects]}}}}
 Doc = Dict[str, Dict[str, Any]]
 
 
 def load_state(path: pathlib.Path) -> Doc:
     raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return {"events": raw.get("events", {}), "health": raw.get("health", {}), "timing": raw.get("timing", {}), "messages": raw.get("messages", {})}
+    return {"events": raw.get("events", {}), "health": raw.get("health", {}), "timing": raw.get("timing", {}), "messages": raw.get("messages", {}), "checked": raw.get("checked", {})}
 
 
 def save_state(path: pathlib.Path, doc: Doc) -> None:
@@ -553,17 +554,30 @@ def plan_digests(unread: Dict[str, List[Msg]], msgs_state: Dict[str, Any]) -> Tu
     return digests, first_seen
 
 
-def settle_messages(msgs_state: Dict[str, Any], name: str, msgs: List[Msg], now: datetime.datetime) -> None:
-    """Remember what is currently unread (keeps first-seen times, forgets messages that were read meanwhile)."""
-    known = msgs_state.get(name, {})
-    msgs_state[name] = {m.id: known.get(m.id, now.isoformat(timespec="seconds")) for m in msgs}
+def settle_messages(doc: Doc, name: str, msgs: List[Msg], now: datetime.datetime) -> None:
+    """Remember what is currently unread (keeps first-seen times, forgets messages that were read meanwhile)
+    and stamp the check time that the next digest's 'since' refers to."""
+    stamp = now.isoformat(timespec="seconds")
+    known = doc["messages"].get(name, {})
+    doc["messages"][name] = {m.id: known.get(m.id, stamp) for m in msgs}
+    doc["checked"][name] = stamp
 
 
-def build_digest(account: str, new: List[Msg], sender: str, to: List[str]) -> EmailMessage:
+def digest_subject(account: str, new: List[Msg], since: Optional[str]) -> str:
+    """One message: who and what. Several: how many, since the last check."""
+    if len(new) == 1:
+        topic = new[0].subject or "(no subject)"
+        topic = topic if len(topic) <= 80 else topic[:79] + "…"
+        return f'[{account}] New message from {new[0].sender or "(unknown)"}: "{topic}"'
+    when = f" since {datetime.datetime.fromisoformat(since):%d.%m %H:%M}" if since else ""
+    return f"[{account}] {len(new)} new messages{when}"
+
+
+def build_digest(account: str, new: List[Msg], sender: str, to: List[str], since: Optional[str] = None) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(to)
-    msg["Subject"] = f"[{account}] {len(new)} new Librus message{'s' if len(new) != 1 else ''}"
+    msg["Subject"] = digest_subject(account, new, since)
     lines = [f"{account} has {len(new)} new unread message{'s' if len(new) != 1 else ''} in Librus:", ""]
     lines += [f"- From: {m.sender or '(unknown)'}\n  Subject: {m.subject or '(no subject)'}\n  Sent: {m.sent[:16]}" for m in new]
     lines += ["", "The messages were not opened, so they are still unread in Librus."]
@@ -818,6 +832,7 @@ def main() -> None:
     doc = load_state(args.state)
     events_state, health = doc["events"], doc["health"]
     msgs_state = doc["messages"]
+    last_checked = dict(doc["checked"])  # as of the previous run, for the digest subjects
     by_account, failures, fresh_timing, unread = fetch_all(cfg["accounts"], args.days, doc["timing"])
     doc["timing"].update(fresh_timing)  # persisted by whichever save_state runs below
 
@@ -841,7 +856,7 @@ def main() -> None:
             if e.key not in events_state:
                 record(events_state, e, 0)
         for name, msgs in unread.items():
-            settle_messages(msgs_state, name, msgs, now)
+            settle_messages(doc, name, msgs, now)
         save_state(args.state, doc)
         logger.info("Baseline saved: %d events and %d unread messages marked as seen", len(events), sum(map(len, unread.values())))
         return
@@ -872,7 +887,8 @@ def main() -> None:
             path = args.outbox / f"{i:02d}_{action}_{e.when:%Y-%m-%d}_{e.account}.eml"
             path.write_bytes(bytes(build_message(change, sender, recipients[e.account])))
         for name, new in digests:
-            (args.outbox / f"digest_{name}.eml").write_bytes(bytes(build_digest(name, new, sender, recipients[name])))
+            (args.outbox / f"digest_{name}.eml").write_bytes(
+                bytes(build_digest(name, new, sender, recipients[name], last_checked.get(name))))
         for i, alert in enumerate(alerts, 1):
             path = args.outbox / f"alert{i:02d}_{alert.kind}_{alert.account}.eml"
             path.write_bytes(bytes(build_alert(alert, sender, admin or "(no admin)", secrets)))
@@ -883,7 +899,7 @@ def main() -> None:
             print(f"  to:      {', '.join(recipients[e.account])}")
             print(f"  when:    {e.when:%Y-%m-%d} {e.when_detail}\n  details: {e.details or '-'}\n")
         for name, new in digests:
-            print(f"DIGEST [{name}] {len(new)} new message(s)  to: {', '.join(recipients[name])}")
+            print(f"DIGEST {digest_subject(name, new, last_checked.get(name))}  to: {', '.join(recipients[name])}")
             for m in new:
                 print(f"  - {m.sender}: {m.subject}  ({m.sent[:16]})")
         for name in first_seen:
@@ -896,7 +912,7 @@ def main() -> None:
         pending = {name for name, _ in digests}
         for name, msgs in unread.items():
             if name not in pending:  # baseline silently / forget messages read meanwhile
-                settle_messages(msgs_state, name, msgs, now)
+                settle_messages(doc, name, msgs, now)
         save_state(args.state, doc)  # count failures even if sending below fails
         if changes or alerts or digests:
             with Mailer(cfg["email"]) as mailer:
@@ -910,8 +926,8 @@ def main() -> None:
                     save_state(args.state, doc)
                     logger.info("Alert %s: %s", alert.kind, alert.account)
                 for name, new in digests:
-                    mailer.send(build_digest(name, new, sender, recipients[name]))
-                    settle_messages(msgs_state, name, unread[name], now)
+                    mailer.send(build_digest(name, new, sender, recipients[name], last_checked.get(name)))
+                    settle_messages(doc, name, unread[name], now)
                     save_state(args.state, doc)
                     logger.info("Sent digest: [%s] %d new message(s)", name, len(new))
                 for change in changes:
