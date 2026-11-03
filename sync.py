@@ -14,6 +14,7 @@ calendar updates the same entry instead of duplicating it:
     new     METHOD:REQUEST, SEQUENCE 0
     update  METHOD:REQUEST, SEQUENCE+1   (description/teacher/room/... changed)
     cancel  METHOD:CANCEL,  SEQUENCE+1   (gone from Librus, still in the window)
+    move    METHOD:REQUEST, SEQUENCE+1   (same event on a new date/lesson, old UID kept)
 
 Librus has no public API, so scraping will break eventually. A failing account
 is isolated (the others still run, and its events are never cancelled), and
@@ -25,6 +26,7 @@ emailed and the state is not touched (dry run).
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime
 import hashlib
 import json
@@ -59,6 +61,7 @@ DEFAULT_EXCLUDE = ["nieobecn", "absen"]
 # upcoming is treated as a broken scraper, not as "everything was removed".
 SUSPICIOUS_EMPTY_MIN_TRACKED = 3
 REALERT_AFTER = datetime.timedelta(hours=24)
+MOVE_WINDOW_DAYS = 21  # a removed + a new event this close in time may be one rescheduled event
 WARSAW = ZoneInfo("Europe/Warsaw")
 RANGE_RE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
 
@@ -87,6 +90,11 @@ class Event:
     # content_hash, so adding or refining times never triggers 'Updated:' mails.
     start: str = ""
     end: str = ""
+    # Calendar UID when it differs from `key` (a rescheduled event keeps the UID it was invited under).
+    uid: str = ""
+    # Transient, set only on a detected move; never persisted.
+    moved_from: str = ""
+    was: str = ""
 
     @property
     def what(self) -> str:
@@ -122,8 +130,15 @@ class Event:
         raw = "|".join([self.interval, self.teacher, self.classroom, self.description, self.link])
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
+    @property
+    def calendar_uid(self) -> str:
+        return self.uid or self.key
+
     def snapshot(self) -> Dict[str, str]:
-        return {**asdict(self), "when": self.when.isoformat()}
+        data = {**asdict(self), "when": self.when.isoformat()}
+        data.pop("moved_from")
+        data.pop("was")
+        return data
 
     @classmethod
     def from_snapshot(cls, data: Dict[str, str]) -> "Event":
@@ -385,7 +400,7 @@ def record(events_state: Dict[str, Any], event: Event, seq: int, cancelled: bool
     }
 
 
-# (action, event, sequence); action in "new" | "update" | "cancel"
+# (action, event, sequence); action in "new" | "update" | "cancel" | "move"
 Change = Tuple[str, Event, int]
 
 
@@ -401,6 +416,36 @@ def tracked_upcoming(events_state: Dict[str, Any], account: str, days: int) -> i
     return count
 
 
+def pair_moves(changes: List[Change]) -> List[Change]:
+    """A removed and a new event of the same account/subject/category, close in time, are one move.
+
+    Only unambiguous pairs: with two candidates on either side nothing is paired (cancel + new stays),
+    because guessing would reschedule the wrong entry.
+    """
+    groups: Dict[Tuple[str, str, str], Tuple[List[Change], List[Change]]] = collections.defaultdict(lambda: ([], []))
+    for change in changes:
+        action, e, seq = change
+        if action == "cancel":
+            groups[(e.account, e.subject, e.category)][0].append(change)
+        elif action == "new" and seq == 0:  # seq > 0 means it reappeared, not that it is a fresh event
+            groups[(e.account, e.subject, e.category)][1].append(change)
+
+    paired: set = set()
+    moves: List[Change] = []
+    for cancels, news in groups.values():
+        if len(cancels) != 1 or len(news) != 1:
+            continue
+        (_, old, seq), (_, new, _) = cancels[0], news[0]
+        if abs((new.when - old.when).days) > MOVE_WINDOW_DAYS:
+            continue
+        new.uid = old.calendar_uid
+        new.moved_from = old.key
+        new.was = f"{old.when:%a %d.%m}" + (f", {old.when_detail}" if old.when_detail else "")
+        moves.append(("move", new, seq))
+        paired.update({id(cancels[0]), id(news[0])})
+    return [c for c in changes if id(c) not in paired] + moves
+
+
 def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Optional[set] = None) -> List[Change]:
     """`skip` holds accounts whose fetch failed: nothing is concluded about them."""
     skip = skip or set()
@@ -414,8 +459,10 @@ def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Opt
         if entry is None:
             changes.append(("new", e, 0))
         elif entry["cancelled"]:
+            e.uid = entry["event"].get("uid", "")
             changes.append(("new", e, entry["seq"] + 1))  # reappeared: re-issue with a newer sequence
         elif entry["hash"] != e.content_hash:
+            e.uid = entry["event"].get("uid", "")
             if e.interval == entry["event"].get("interval", ""):
                 # times derive from the lesson: keep what was sent. An edited explicit range is real news.
                 e.start, e.end = entry["event"].get("start", ""), entry["event"].get("end", "")
@@ -427,7 +474,7 @@ def diff(events: List[Event], events_state: Dict[str, Any], days: int, skip: Opt
         old = Event.from_snapshot(entry["event"])
         if today <= old.when <= horizon:  # only judge events the fetch could actually have seen
             changes.append(("cancel", old, entry["seq"] + 1))
-    return changes
+    return pair_moves(changes)
 
 
 # --- alerts -----------------------------------------------------------------
@@ -543,7 +590,7 @@ def build_ics(event: Event, sender: str, attendees: List[str], method: str = "RE
         "PRODID:-//librus-sync//EN",
         f"METHOD:{method}",
         "BEGIN:VEVENT",
-        f"UID:{event.key}@librus-sync",
+        f"UID:{event.calendar_uid}@librus-sync",
         f"DTSTAMP:{stamp}",
         *(
             [f"DTSTART:{_utc(event.when, event.start)}", f"DTEND:{_utc(event.when, event.end)}"]
@@ -585,7 +632,7 @@ def gcal_link(event: Event) -> str:
 def build_message(change: Change, sender: str, to: List[str], test: bool = False) -> EmailMessage:
     action, event, sequence = change
     cancel = action == "cancel"
-    prefix = ("[TEST] " if test else "") + {"new": "", "update": "Updated: ", "cancel": "Cancelled: "}[action]
+    prefix = ("[TEST] " if test else "") + {"new": "", "update": "Updated: ", "cancel": "Cancelled: ", "move": "Rescheduled: "}[action]
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(to)
@@ -594,6 +641,7 @@ def build_message(change: Change, sender: str, to: List[str], test: bool = False
     body = (
         f"{'This event was removed from Librus.' + chr(10) if cancel else ''}"
         f"{'This event was changed in Librus.' + chr(10) if action == 'update' else ''}"
+        f"{'This event was moved in Librus.' + chr(10) + 'Was:     ' + event.was + chr(10) if action == 'move' else ''}"
         f"What:    {event.account} - {event.what}\n"
         f"When:    {when}\n"
         f"Details:\n{event.details or '-'}\n"
@@ -703,7 +751,7 @@ def main() -> None:
 
     changes = [c for c in diff(events, events_state, args.days, skip=set(failures)) if c[1].account in recipients]
     alerts = plan_alerts(health, failures, list(by_account), now)
-    counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel")}
+    counts = {a: sum(1 for c in changes if c[0] == a) for a in ("new", "update", "cancel", "move")}
     logger.info("%d fetched (%d timed), %d after filter: %s; %d failing account(s), %d alert(s)",
                 len(fetched), sum(1 for e in fetched if e.start), len(events), counts, len(failures), len(alerts))
     if failures and not admin:
@@ -754,6 +802,8 @@ def main() -> None:
                     action, e, seq = change
                     mailer.send(build_message(change, sender, recipients[e.account]))
                     record(events_state, e, seq, cancelled=action == "cancel")
+                    if action == "move":
+                        events_state[e.moved_from]["cancelled"] = True  # its UID now lives on the new entry
                     save_state(args.state, doc)  # per email, so a crash never re-sends
                     logger.info("Sent %s: [%s] %s %s", action, e.account, e.when, e.what)
 
