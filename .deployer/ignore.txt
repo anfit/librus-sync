@@ -3,3 +3,4 @@ config.yaml
 state.json
 outbox/
 README*
+config.example.yml

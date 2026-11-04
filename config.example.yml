@@ -1,0 +1,45 @@
+# Template for config.yml (or config.yaml). Copy it, fill in real values, never commit the copy:
+# both names are gitignored. Everything below is a placeholder.
+#
+# Credentials can be given in two ways, per field:
+#   username: "..."          a literal value (fine for a local file that is not committed)
+#   username_env: VAR_NAME   the name of an environment variable (what the deployed config uses)
+
+accounts:
+  - name: Child One                   # shown in subjects: "[Child One] ..."
+    username: librus.login.one
+    password: change-me
+    recipients:                       # calendar emails (new / updated / rescheduled / cancelled events)
+      - parent.one@example.com
+      - parent.two@example.com
+      - child.one@example.com
+    message_recipients:               # unread-message digests. Parents only; if omitted, no digest is sent
+      - parent.one@example.com
+      - parent.two@example.com
+
+  - name: Child Two
+    username_env: LIBRUS_CHILD_TWO_USERNAME
+    password_env: LIBRUS_CHILD_TWO_PASSWORD
+    recipients:
+      - parent.one@example.com
+      - parent.two@example.com
+    message_recipients:
+      - parent.one@example.com
+      - parent.two@example.com
+
+email:                                # SMTP account used for everything the tool sends
+  host: smtp.example.com
+  port: 465
+  username: mailer@example.com        # or username_env: ...
+  password: change-me                 # or password_env: ...
+  sender: mailer@example.com          # also the organizer of the calendar invitations
+  use_ssl: true                       # implicit TLS (port 465)
+  use_starttls: false                 # set to true (and use_ssl to false) for port 587
+
+admin: admin@example.com              # told when the scraper breaks, and when it recovers
+
+# Optional. Calendar entries whose category or subject contains any of these (case-insensitive)
+# are skipped. Default shown: absences.
+# exclude:
+#   - nieobecn
+#   - absen
