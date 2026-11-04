@@ -583,22 +583,27 @@ def settle_messages(doc: Doc, name: str, msgs: List[Msg], now: datetime.datetime
     doc["checked"][name] = stamp
 
 
-def digest_subject(account: str, new: List[Msg], since: Optional[str]) -> str:
-    """One message: who and what. Several: how many, since the last check."""
+def digest_subject(account: str, new: List[Msg], since: Optional[str], backlog: bool = False) -> str:
+    """One message: who and what. Several: how many, since the last check (or, for a backlog, how many unread)."""
     if len(new) == 1:
         topic = new[0].subject or "(no subject)"
         topic = topic if len(topic) <= 80 else topic[:79] + "…"
-        return f'[{account}] New message from {new[0].sender or "(unknown)"}: "{topic}"'
+        return f'[{account}] {"Unread" if backlog else "New"} message from {new[0].sender or "(unknown)"}: "{topic}"'
+    if backlog:
+        return f"[{account}] {len(new)} unread messages"
     when = f" since {datetime.datetime.fromisoformat(since):%d.%m %H:%M}" if since else ""
     return f"[{account}] {len(new)} new messages{when}"
 
 
-def build_digest(account: str, new: List[Msg], sender: str, to: List[str], since: Optional[str] = None) -> EmailMessage:
+def build_digest(
+    account: str, new: List[Msg], sender: str, to: List[str], since: Optional[str] = None, backlog: bool = False
+) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(to)
-    msg["Subject"] = digest_subject(account, new, since)
-    lines = [f"{account} has {len(new)} new unread message{'s' if len(new) != 1 else ''} in Librus:", ""]
+    msg["Subject"] = digest_subject(account, new, since, backlog)
+    kind = "currently has" if backlog else "has"
+    lines = [f"{account} {kind} {len(new)} {'' if backlog else 'new '}unread message{'s' if len(new) != 1 else ''} in Librus:", ""]
     lines += [f"- From: {m.sender or '(unknown)'}\n  Subject: {m.subject or '(no subject)'}\n  Sent: {m.sent[:16]}" for m in new]
     lines += ["", "The messages were not opened, so they are still unread in Librus."]
     msg.set_content("\n".join(lines) + "\n")
@@ -833,6 +838,10 @@ def main() -> None:
         "--test-digest", metavar="ADDR",
         help="send sample digests (both subject formats) built from REAL unread messages to ADDR only; state untouched",
     )
+    parser.add_argument(
+        "--send-unread", action="store_true",
+        help="one-off: send each account's digest of ALL currently unread messages to its message_recipients; state untouched",
+    )
     parser.add_argument("--baseline", action="store_true", help="mark all current events as seen without emailing")
     args = parser.parse_args()
 
@@ -860,6 +869,15 @@ def main() -> None:
     last_checked = dict(doc["checked"])  # as of the previous run, for the digest subjects
     by_account, failures, fresh_timing, unread = fetch_all(cfg["accounts"], args.days, doc["timing"])
     doc["timing"].update(fresh_timing)  # persisted by whichever save_state runs below
+
+    if args.send_unread:
+        with Mailer(cfg["email"]) as mailer:
+            for name, msgs in unread.items():
+                if msgs:
+                    mailer.send(build_digest(name, msgs, sender, message_recipients[name], backlog=True))
+                    logger.info("Unread digest sent: [%s] %d message(s) to %d parent(s) (state untouched)",
+                                name, len(msgs), len(message_recipients[name]))
+        return
 
     if args.test_digest:
         samples = sample_digests(unread, now)
