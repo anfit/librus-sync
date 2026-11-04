@@ -92,16 +92,16 @@ minutes of jitter). Each run builds (or reuses) a virtual environment under
 no state yet it records a baseline instead.
 
 The deployer builds the release from the working tree of this repository, so commit before
-applying. From a PowerShell session with `PROJECTS_DIR`, `SERVICE_INFRA_DIR`, `VPS_DEPLOYER_DIR` and
-the secret variables set:
+applying. With `vps-deployer` installed (`pipx install vps-deployer`, 1.3.1 or newer) and
+`PROJECTS_DIR`, `SERVICE_INFRA_DIR` and the secret variables set:
 
 ```powershell
-$d = "$env:VPS_DEPLOYER_DIR\.venv\Scripts\vps-deployer.exe"
-& $d --repo $env:SERVICE_INFRA_DIR validate
-& $d --repo $env:SERVICE_INFRA_DIR plan  librus-sync-prod     # review it
-& $d --repo $env:SERVICE_INFRA_DIR apply librus-sync-prod
-& $d --repo $env:SERVICE_INFRA_DIR status librus-sync-prod    # healthy; shows the last job's result
-& $d --repo $env:SERVICE_INFRA_DIR logs   librus-sync-prod
+vps-deployer validate
+vps-deployer secrets check librus-sync-prod
+vps-deployer plan  librus-sync-prod     # review it
+vps-deployer apply librus-sync-prod
+vps-deployer status librus-sync-prod    # healthy; shows the last job's result
+vps-deployer logs   librus-sync-prod
 ```
 
 A repeated `plan` after a successful `apply` reports "No changes". `status` reads "unhealthy" while
