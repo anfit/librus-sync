@@ -13,7 +13,9 @@ without ever marking anything as read.
 - **Breakage** is reported to an admin address: Librus has no public API, so this is a scraper and
   will stop working sooner or later.
 
-It replaces `librus-notifier`, which marked messages as read by opening them.
+> **Unofficial.** Not affiliated with or endorsed by Librus. It scrapes a service that has no public
+> API, so use it only with your own or your children's accounts, and at your own risk. Check that
+> this is acceptable under the terms that apply to your account.
 
 ## How it works
 
@@ -75,37 +77,12 @@ would email the same new event.
 
 ## Deployment
 
-The service is deployed to the production VPS with [vps-deployer](../vps-deployer), driven by the
-desired-state manifests in [service-infra](../service-infra). This repository only holds the
-application and its entrypoint in `.deployer/`; everything about the host lives in `service-infra`.
+The tool is a one-shot command, so any scheduler will do (cron, a systemd timer, Task Scheduler).
+Run `sync.py --send` a few times a day with a persistent `--state` file. On the very first run use
+`--baseline` so nothing the family already received is mailed again.
 
-| Piece | Where |
-| --- | --- |
-| Application and entrypoint | this repo: `sync.py`, `.deployer/run.sh`, `.deployer/expect.yaml`, `.deployer/ignore.txt` |
-| Deployment manifest (`librus-sync-prod`) | `service-infra/deployments/librus-sync/prod.yaml` |
-| Production config (no secrets) | `service-infra/configs/librus-sync/prod.yaml`, installed as `config/production.yaml` |
-| Secrets | Windows User environment variables, referenced from the manifest (see `service-infra/docs/secrets.md`) |
-
-It runs as a systemd oneshot on a timer, at 07:30, 13:30 and 19:30 Europe/Warsaw (up to five
-minutes of jitter). Each run builds (or reuses) a virtual environment under
-`/var/lib/librus-sync-prod`, which also holds `state.json`, then runs `sync.py --send`. When there is
-no state yet it records a baseline instead.
-
-The deployer builds the release from the working tree of this repository, so commit before
-applying. With `vps-deployer` installed (`pipx install vps-deployer`, 1.3.1 or newer) and
-`PROJECTS_DIR`, `SERVICE_INFRA_DIR` and the secret variables set:
-
-```powershell
-vps-deployer validate
-vps-deployer secrets check librus-sync-prod
-vps-deployer plan  librus-sync-prod     # review it
-vps-deployer apply librus-sync-prod
-vps-deployer status librus-sync-prod    # healthy; shows the last job's result
-vps-deployer logs   librus-sync-prod
-```
-
-A repeated `plan` after a successful `apply` reports "No changes". `status` reads "unhealthy" while
-the working tree differs from the active release, which just means a deploy is pending.
+`.deployer/` holds the entrypoint and manifest used for the author's own deployment tooling; you
+can ignore it.
 
 ## Dependencies
 
@@ -123,3 +100,7 @@ the working tree differs from the active release, which just means a deploy is p
 - Delivery of invitations into Google Calendar depends on the recipient's calendar settings
   ("add invitations to my calendar"). Every calendar email also carries an "Add to Google Calendar"
   link.
+
+## License
+
+AGPL-3.0, see [`LICENSE`](LICENSE). This follows from the AGPL-licensed `librus_pyapi` dependency.
